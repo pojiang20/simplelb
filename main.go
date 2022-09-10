@@ -1,9 +1,11 @@
-package simplelb
+package main
 
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -64,6 +66,61 @@ func (s *ServerPool) MarkBackendStatus(backendUrl *url.URL, alive bool) {
 	}
 }
 
+func isBackendAlive(u *url.URL) bool {
+	timeout := 2 * time.Second
+	conn, err := net.DialTimeout("tcp", u.Host, timeout)
+	if err != nil {
+		log.Println("Site unreachable,error: ", err)
+		return false
+	}
+	defer conn.Close()
+	return true
+}
+
+func (s *ServerPool) HealthCheck() {
+	for _, b := range s.backends {
+		status := "up"
+		//send tcp connection to check alive
+		alive := isBackendAlive(b.URL)
+		b.SetAlive(alive)
+		if !alive {
+			status = "down"
+		}
+		log.Printf("%s [%s]", b.URL, status)
+	}
+}
+
+func GetAttemptsFromContext(r *http.Request) int {
+	if attempts, ok := r.Context().Value(Attempts).(int); ok {
+		return attempts
+	}
+	return 1
+}
+
+func GetRetryFromContext(r *http.Request) int {
+	if retry, ok := r.Context().Value(Retry).(int); ok {
+		return retry
+	}
+	return 0
+}
+
+func lb(w http.ResponseWriter, r *http.Request) {
+	attemps := GetAttemptsFromContext(r)
+	if attemps > 3 {
+		log.Printf("(%s)(%s) Max attempts reached,terminating\n", r.RemoteAddr, r.URL.Path)
+		http.Error(w, "Service not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	peer := serverPool.GetNextPeer()
+	if peer != nil {
+		log.Printf("change server to peer: %s", peer.URL)
+		peer.ReverseProxy.ServeHTTP(w, r)
+		return
+	}
+	http.Error(w, "Service not available", http.StatusServiceUnavailable)
+}
+
 // returns next active peer to take a connection
 func (s *ServerPool) GetNextPeer() *Backend {
 	next := s.NextIndex()
@@ -71,7 +128,6 @@ func (s *ServerPool) GetNextPeer() *Backend {
 	for i := 0; i < length; i++ {
 		idx := (next + i) % length //start from "next" and move a full cycle length
 		if s.backends[idx].IsAlive() {
-			//TODO 提一个issue
 			if idx != next {
 				atomic.StoreUint64(&s.current, uint64(idx))
 			}
@@ -81,12 +137,35 @@ func (s *ServerPool) GetNextPeer() *Backend {
 	return nil
 }
 
+func healthCheck() {
+	go func() {
+		t := time.NewTicker(time.Minute * 2)
+		for {
+			select {
+			case <-t.C:
+				log.Printf("Starting health check..")
+				serverPool.HealthCheck()
+				log.Printf("Health check completed")
+			}
+		}
+	}()
+}
+
 var serverPool ServerPool
+
+func HelloHandler(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintf(w, "Hello World:%s", r.URL)
+}
+
+func StartServer(port string) {
+	http.HandleFunc("/"+port, HelloHandler)
+	http.ListenAndServe(fmt.Sprintf(":%s", port), nil)
+}
 
 func main() {
 	var serverList string
 	var port int
-	flag.StringVar(&serverList, "backends", "", "Load balanced backends,use commas to separete")
+	flag.StringVar(&serverList, "backends", "", "Load balanced backends,use commas to separate")
 	flag.IntVar(&port, "port", 3030, "Port to serve")
 	flag.Parse()
 
@@ -97,6 +176,7 @@ func main() {
 	tokens := strings.Split(serverList, ",")
 	for _, tok := range tokens {
 		serverUrl, err := url.Parse(tok)
+		go StartServer(serverUrl.Port())
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -115,7 +195,32 @@ func main() {
 			}
 
 			//after 3 retries, mark this backend as down
-			//serverPool.Ma
+			serverPool.MarkBackendStatus(serverUrl, false)
+
+			//QA what's the attempts mean?
+			attempts := GetAttemptsFromContext(request)
+			log.Printf("%s(%s) Attempting retry %d\n", request.RemoteAddr, request.URL.Path, attempts)
+			ctx := context.WithValue(request.Context(), Attempts, attempts+1)
+			lb(writer, request.WithContext(ctx))
 		}
+
+		serverPool.AddBackend(&Backend{
+			URL:          serverUrl,
+			Alive:        true,
+			ReverseProxy: proxy,
+		})
+		log.Printf("Configured server: %s\n", serverUrl)
+	}
+
+	server := http.Server{
+		Addr:    fmt.Sprintf(":%d", port),
+		Handler: http.HandlerFunc(lb),
+	}
+
+	healthCheck()
+
+	log.Printf("Load Balancer started at :%d\n", port)
+	if err := server.ListenAndServe(); err != nil {
+		log.Fatal(err)
 	}
 }
