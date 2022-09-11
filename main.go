@@ -4,13 +4,14 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"github.com/simplelb/backend"
+	"github.com/simplelb/selector"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -20,40 +21,22 @@ const (
 	Retry
 )
 
-// Backend holds the data about a server
-type Backend struct {
-	URL          *url.URL
-	Alive        bool
-	mux          sync.RWMutex
-	ReverseProxy *httputil.ReverseProxy
-}
-
-func (b *Backend) SetAlive(alive bool) {
-	b.mux.Lock()
-	b.Alive = alive
-	b.mux.Unlock()
-}
-
-func (b *Backend) IsAlive() (alive bool) {
-	b.mux.RLock()
-	alive = b.Alive
-	b.mux.RUnlock()
-	return
-}
-
 // ServerPool holds information about reachable backends
 type ServerPool struct {
-	backends []*Backend
+	backends []*backend.Backend
 	current  uint64
+	sel selector.Next
 }
 
-func (s *ServerPool) AddBackend(backend *Backend) {
+func NewServerPool() (*ServerPool,error) {
+	tmp := &ServerPool{
+		sel: selector.RoundR{}
+	}
+	return tmp,nil
+}
+
+func (s *ServerPool) AddBackend(backend *backend.Backend) {
 	s.backends = append(s.backends, backend)
-}
-
-// atomically increase the counter and return an index
-func (s *ServerPool) NextIndex() int {
-	return int(atomic.AddUint64(&s.current, uint64(1)) % uint64(len(s.backends)))
 }
 
 // changes a status of a backend
@@ -121,12 +104,12 @@ func lb(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "Service not available", http.StatusServiceUnavailable)
 }
 
-// returns next active peer to take a connection
-func (s *ServerPool) GetNextPeer() *Backend {
-	next := s.NextIndex()
+// returns selector active peer to take a connection
+func (s *ServerPool) GetNextPeer() *backend.Backend {
+	next := s.sel.NextIndex()
 	length := len(s.backends)
 	for i := 0; i < length; i++ {
-		idx := (next + i) % length //start from "next" and move a full cycle length
+		idx := (next + i) % length //start from "selector" and move a full cycle length
 		if s.backends[idx].IsAlive() {
 			if idx != next {
 				atomic.StoreUint64(&s.current, uint64(idx))
@@ -153,15 +136,6 @@ func healthCheck() {
 
 var serverPool ServerPool
 
-func HelloHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, "Hello World:%s", r.URL)
-}
-
-func StartServer(port string) {
-	http.HandleFunc("/"+port, HelloHandler)
-	http.ListenAndServe(fmt.Sprintf(":%s", port), nil)
-}
-
 func main() {
 	var serverList string
 	var port int
@@ -176,7 +150,6 @@ func main() {
 	tokens := strings.Split(serverList, ",")
 	for _, tok := range tokens {
 		serverUrl, err := url.Parse(tok)
-		go StartServer(serverUrl.Port())
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -204,11 +177,8 @@ func main() {
 			lb(writer, request.WithContext(ctx))
 		}
 
-		serverPool.AddBackend(&Backend{
-			URL:          serverUrl,
-			Alive:        true,
-			ReverseProxy: proxy,
-		})
+		backend, _ := backend.NewBackend(serverUrl, proxy)
+		serverPool.AddBackend(backend)
 		log.Printf("Configured server: %s\n", serverUrl)
 	}
 
